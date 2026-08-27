@@ -3,8 +3,12 @@ import Carbon.HIToolbox
 import EasyStickyCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private static let selectedTextHotKeyID: UInt32 = 3
+    private static let selectedTextShortcutDefaultsKey = "selectedTextShortcut"
+
     private let store: NoteStore
     private let hotKeyManager = GlobalHotKeyManager()
+    private let selectedTextCapture = SelectedTextCapture()
 
     private var notes: [UUID: StickyNote] = [:]
     private var controllers: [UUID: StickyNoteWindowController] = [:]
@@ -14,6 +18,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dynamicPinItems: [NSMenuItem] = []
     private var dynamicSpaceItems: [NSMenuItem] = []
     private var dynamicThemeItems: [NSMenuItem] = []
+    private var selectedTextMenuItems: [NSMenuItem] = []
+    private var selectedTextShortcut = KeyboardShortcut.selectedTextDefault
+    private var isRecordingSelectedTextShortcut = false
+    private var preferencesWindowController: ShortcutPreferencesWindowController?
 
     override init() {
         let environment = ProcessInfo.processInfo.environment
@@ -36,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dataDirectory = applicationSupport.appendingPathComponent("EasySticky", isDirectory: true)
         }
         store = NoteStore(fileURL: dataDirectory.appendingPathComponent("notes.json"))
+        selectedTextShortcut = Self.loadSelectedTextShortcut()
         super.init()
     }
 
@@ -78,7 +87,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func newNote(_ sender: Any?) {
-        let note = StickyNote(frame: WindowFrame(nextDefaultFrame()))
+        createNote(content: "")
+    }
+
+    private func createNote(content: String) {
+        let note = StickyNote(content: content, frame: WindowFrame(nextDefaultFrame()))
         notes[note.id] = note
         let controller = makeController(for: note)
         controllers[note.id] = controller
@@ -86,6 +99,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.show(focus: true)
         scheduleSave()
         refreshMenuStates()
+    }
+
+    @objc private func newNoteFromSelectedText(_ sender: Any?) {
+        selectedTextCapture.capture { [weak self] result in
+            switch result {
+            case .success(let text):
+                self?.createNote(content: text)
+            case .failure(let error):
+                self?.presentCaptureError(error)
+            }
+        }
+    }
+
+    @objc private func showShortcutPreferences(_ sender: Any?) {
+        if preferencesWindowController == nil {
+            preferencesWindowController = ShortcutPreferencesWindowController(
+                shortcut: selectedTextShortcut,
+                onShortcutChange: { [weak self] shortcut in
+                    self?.updateSelectedTextShortcut(shortcut) ?? false
+                },
+                onRecordingChange: { [weak self] isRecording in
+                    self?.setSelectedTextShortcutRecording(isRecording)
+                },
+                onRequestAccessibility: { [weak self] in
+                    self?.requestAccessibilityPermission()
+                }
+            )
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        preferencesWindowController?.showWindow(nil)
+        preferencesWindowController?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func showAllNotes(_ sender: Any?) {
@@ -298,10 +342,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let hasVisibleWindow = self.controllers.values.contains { $0.window?.isVisible == true }
             hasVisibleWindow ? self.hideAllNotes(nil) : self.showAllNotes(nil)
         }
+        let selectedTextRegistered = registerSelectedTextHotKey(selectedTextShortcut)
 
-        if !newNoteRegistered || !visibilityRegistered {
+        if !newNoteRegistered || !visibilityRegistered || !selectedTextRegistered {
             NSLog("Easy Sticky could not register one or more global hotkeys")
         }
+    }
+
+    private func registerSelectedTextHotKey(_ shortcut: KeyboardShortcut) -> Bool {
+        hotKeyManager.register(
+            id: Self.selectedTextHotKeyID,
+            keyCode: shortcut.keyCode,
+            modifiers: shortcut.modifiers
+        ) { [weak self] in
+            self?.newNoteFromSelectedText(nil)
+        }
+    }
+
+    private func updateSelectedTextShortcut(_ shortcut: KeyboardShortcut) -> Bool {
+        let previousShortcut = selectedTextShortcut
+        guard registerSelectedTextHotKey(shortcut) else {
+            if !isRecordingSelectedTextShortcut {
+                _ = registerSelectedTextHotKey(previousShortcut)
+            }
+            return false
+        }
+
+        selectedTextShortcut = shortcut
+        if let encoded = try? JSONEncoder().encode(shortcut) {
+            UserDefaults.standard.set(encoded, forKey: Self.selectedTextShortcutDefaultsKey)
+        }
+        refreshSelectedTextMenuTitles()
+        return true
+    }
+
+    private func setSelectedTextShortcutRecording(_ isRecording: Bool) {
+        isRecordingSelectedTextShortcut = isRecording
+        if isRecording {
+            hotKeyManager.unregister(id: Self.selectedTextHotKeyID)
+        } else {
+            _ = registerSelectedTextHotKey(selectedTextShortcut)
+        }
+    }
+
+    private static func loadSelectedTextShortcut() -> KeyboardShortcut {
+        guard
+            let data = UserDefaults.standard.data(forKey: selectedTextShortcutDefaultsKey),
+            let shortcut = try? JSONDecoder().decode(KeyboardShortcut.self, from: data)
+        else {
+            return .selectedTextDefault
+        }
+        return shortcut
     }
 
     private func configureStatusItem() {
@@ -315,6 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu(title: "Easy Sticky")
         menu.delegate = self
         menu.addItem(makeItem("新建便签", action: #selector(newNote(_:))))
+        menu.addItem(makeSelectedTextMenuItem())
         menu.addItem(makeItem("显示全部便签", action: #selector(showAllNotes(_:))))
         menu.addItem(makeItem("隐藏全部便签", action: #selector(hideAllNotes(_:))))
         menu.addItem(.separator())
@@ -341,6 +433,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appMenu = NSMenu(title: "Easy Sticky")
         appMenu.addItem(makeItem("关于 Easy Sticky", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), target: NSApp))
         appMenu.addItem(.separator())
+        appMenu.addItem(makeItem("快捷键设置…", action: #selector(showShortcutPreferences(_:)), key: ","))
+        appMenu.addItem(.separator())
         appMenu.addItem(makeItem("隐藏 Easy Sticky", action: #selector(NSApplication.hide(_:)), key: "h", target: NSApp))
         appMenu.addItem(makeItem("退出 Easy Sticky", action: #selector(NSApplication.terminate(_:)), key: "q", target: NSApp))
         appRoot.submenu = appMenu
@@ -349,6 +443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fileRoot = NSMenuItem()
         let fileMenu = NSMenu(title: "文件")
         fileMenu.addItem(makeItem("新建便签", action: #selector(newNote(_:)), key: "n"))
+        fileMenu.addItem(makeSelectedTextMenuItem())
         fileMenu.addItem(makeItem("关闭便签", action: #selector(closeCurrentNote(_:)), key: "w"))
         fileMenu.addItem(.separator())
         let deleteItem = makeItem("删除便签…", action: #selector(deleteCurrentNote(_:)), key: "\u{8}")
@@ -395,20 +490,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func makeThemeRootItem() -> NSMenuItem {
         let root = NSMenuItem(title: "便签颜色", action: nil, keyEquivalent: "")
         let menu = NSMenu(title: "便签颜色")
-        let titles: [NoteTheme: String] = [
-            .yellow: "暖黄",
-            .mint: "薄荷绿",
-            .blue: "天空蓝",
-            .rose: "玫瑰粉"
-        ]
         for theme in NoteTheme.allCases {
-            let item = makeItem(titles[theme] ?? theme.rawValue, action: #selector(setCurrentTheme(_:)))
+            let item = makeItem(theme.displayName, action: #selector(setCurrentTheme(_:)))
             item.representedObject = theme.rawValue
+            item.image = theme.menuImage
             dynamicThemeItems.append(item)
             menu.addItem(item)
         }
         root.submenu = menu
         return root
+    }
+
+    private func makeSelectedTextMenuItem() -> NSMenuItem {
+        let item = makeItem(
+            "从选中文本新建便签（\(selectedTextShortcut.displayName)）",
+            action: #selector(newNoteFromSelectedText(_:))
+        )
+        selectedTextMenuItems.append(item)
+        return item
+    }
+
+    private func refreshSelectedTextMenuTitles() {
+        selectedTextMenuItems.forEach {
+            $0.title = "从选中文本新建便签（\(selectedTextShortcut.displayName)）"
+        }
     }
 
     private func makeItem(
@@ -452,5 +557,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             $0.isEnabled = true
             $0.state = ($0.representedObject as? String) == note.theme.rawValue ? .on : .off
         }
+    }
+
+    private func requestAccessibilityPermission() {
+        let trusted = selectedTextCapture.requestAccessibilityPermission()
+        guard !trusted else {
+            presentAlert(
+                message: "辅助功能权限已开启",
+                detail: "现在可以在其他应用中选中文本并使用 \(selectedTextShortcut.displayName) 创建便签。"
+            )
+            return
+        }
+        presentAlert(
+            message: "请允许 Easy Sticky 控制电脑",
+            detail: "在“系统设置 > 隐私与安全性 > 辅助功能”中开启 Easy Sticky，然后重新使用快捷键。"
+        )
+    }
+
+    private func presentCaptureError(_ error: SelectedTextCaptureError) {
+        if error == .accessibilityPermissionRequired {
+            requestAccessibilityPermission()
+            return
+        }
+        presentAlert(message: "无法创建便签", detail: error.localizedDescription)
+    }
+
+    private func presentAlert(message: String, detail: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.addButton(withTitle: "知道了")
+        alert.runModal()
     }
 }

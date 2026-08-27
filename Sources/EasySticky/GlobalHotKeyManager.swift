@@ -64,6 +64,8 @@ final class GlobalHotKeyManager {
         if let existingReference = references[id] {
             UnregisterEventHotKey(existingReference)
         }
+        references[id] = nil
+        actions[id] = nil
 
         let identifier = EventHotKeyID(signature: Self.signature, id: id)
         var reference: EventHotKeyRef?
@@ -80,6 +82,13 @@ final class GlobalHotKeyManager {
         references[id] = reference
         actions[id] = action
         return true
+    }
+
+    func unregister(id: UInt32) {
+        if let reference = references.removeValue(forKey: id) {
+            UnregisterEventHotKey(reference)
+        }
+        actions[id] = nil
     }
 
     fileprivate func performAction(for id: UInt32) {

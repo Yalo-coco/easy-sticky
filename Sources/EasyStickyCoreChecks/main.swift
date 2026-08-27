@@ -54,6 +54,35 @@ run("default behavior matches product plan") {
     try check(note.theme == .yellow, "new notes must use the yellow theme")
 }
 
+run("palette themes are complete and stable") {
+    let expectedRawValues = [
+        "yellow", "orange", "rose", "lavender", "blue", "mint", "sage", "graphite"
+    ]
+
+    try check(NoteTheme.allCases.map(\.rawValue) == expectedRawValues, "palette order or storage keys changed")
+    try check(Set(expectedRawValues).count == expectedRawValues.count, "palette contains duplicate storage keys")
+}
+
+run("each note preserves its independent color") {
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
+
+    for theme in NoteTheme.allCases {
+        let original = StickyNote(content: theme.rawValue, theme: theme)
+        let restored = try decoder.decode(StickyNote.self, from: encoder.encode(original))
+        try check(restored.theme == theme, "failed to preserve \(theme.rawValue)")
+    }
+}
+
+run("selected text shortcut round-trip is stable") {
+    let original = KeyboardShortcut.selectedTextDefault
+    let data = try JSONEncoder().encode(original)
+    let restored = try JSONDecoder().decode(KeyboardShortcut.self, from: data)
+
+    try check(restored == original, "shortcut changed after persistence")
+    try check(restored.keyLabel == "Y", "default shortcut label is incorrect")
+}
+
 run("offscreen frame moves into visible area") {
     let visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
     let original = WindowFrame(x: 3000, y: -500, width: 320, height: 260)

@@ -8,9 +8,32 @@ public enum NoteDisplayMode: String, Codable, CaseIterable, Sendable {
 
 public enum NoteTheme: String, Codable, CaseIterable, Sendable {
     case yellow
-    case mint
-    case blue
+    case orange
     case rose
+    case lavender
+    case blue
+    case mint
+    case sage
+    case graphite
+}
+
+public struct KeyboardShortcut: Codable, Equatable, Sendable {
+    public var keyCode: UInt32
+    public var modifiers: UInt32
+    public var keyLabel: String
+
+    public init(keyCode: UInt32, modifiers: UInt32, keyLabel: String) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+        self.keyLabel = keyLabel
+    }
+
+    // Carbon key code for Y with Command + Option.
+    public static let selectedTextDefault = KeyboardShortcut(
+        keyCode: 0x10,
+        modifiers: 0x0900,
+        keyLabel: "Y"
+    )
 }
 
 public struct WindowFrame: Codable, Equatable, Sendable {
