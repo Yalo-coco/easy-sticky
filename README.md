@@ -98,9 +98,11 @@ xcode-select --install
 
 ### 构建并运行
 
-将本仓库克隆或下载到本地，在仓库根目录运行：
+克隆本仓库并构建：
 
 ```bash
+git clone https://github.com/Yalo-coco/easy-sticky.git
+cd easy-sticky
 make app
 open ".build/Easy Sticky.app"
 ```

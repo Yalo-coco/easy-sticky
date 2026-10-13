@@ -633,7 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showHelp(_ sender: Any?) {
-        NSWorkspace.shared.open(URL(string: "https://code.byted.org/liuyalong.yalo/easy-sticky")!)
+        NSWorkspace.shared.open(URL(string: "https://github.com/Yalo-coco/easy-sticky")!)
     }
 
     private func makeThemeRootItem() -> NSMenuItem {
