@@ -2,3 +2,10 @@
 .DS_Store
 *.xcuserstate
 xcuserdata/
+tmp/
+.swiftpm/
+.env
+.env.*
+!.env.example
+notes.json
+notes.backup.json

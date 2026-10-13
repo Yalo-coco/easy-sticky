@@ -22,6 +22,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var selectedTextShortcut = KeyboardShortcut.selectedTextDefault
     private var isRecordingSelectedTextShortcut = false
     private var preferencesWindowController: ShortcutPreferencesWindowController?
+    private var libraryWindowController: NoteLibraryWindowController?
+    private lazy var reminderService = ReminderService()
+    private var storageAvailable = true
+    private var actionShortcuts: [String: KeyboardShortcut] = [:]
+    private static let actionIDs: [String: UInt32] = ["new": 1, "show": 4, "hide": 5]
+    private static let defaultShortcuts: [String: KeyboardShortcut] = [
+        "new": KeyboardShortcut(keyCode: 0x2D, modifiers: 0x0900, keyLabel: "N"),
+        "show": KeyboardShortcut(keyCode: 0x13, modifiers: 0x0800, keyLabel: "2"),
+        "hide": KeyboardShortcut(keyCode: 0x14, modifiers: 0x0800, keyLabel: "3")
+    ]
 
     override init() {
         let environment = ProcessInfo.processInfo.environment
@@ -45,6 +55,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         store = NoteStore(fileURL: dataDirectory.appendingPathComponent("notes.json"))
         selectedTextShortcut = Self.loadSelectedTextShortcut()
+        for (key, fallback) in Self.defaultShortcuts {
+            actionShortcuts[key] = UserDefaults.standard.data(forKey: "shortcut.\(key)").flatMap { try? JSONDecoder().decode(KeyboardShortcut.self, from: $0) } ?? fallback
+        }
         super.init()
     }
 
@@ -61,9 +74,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
 
         loadNotes()
+        guard storageAvailable else { return }
+        reminderService.onOpenNote = { [weak self] id in self?.openNote(id) }
+        reminderService.restore(Array(notes.values))
         restoreWindows()
         refreshMenuStates()
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -90,8 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         createNote(content: "")
     }
 
-    private func createNote(content: String) {
-        let note = StickyNote(content: content, frame: WindowFrame(nextDefaultFrame()))
+    private func createNote(content: String, richContent: Data? = nil) {
+        var note = StickyNote(content: content, frame: WindowFrame(nextDefaultFrame()))
+        note.richContent = richContent
         notes[note.id] = note
         let controller = makeController(for: note)
         controllers[note.id] = controller
@@ -104,8 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func newNoteFromSelectedText(_ sender: Any?) {
         selectedTextCapture.capture { [weak self] result in
             switch result {
-            case .success(let text):
-                self?.createNote(content: text)
+            case .success(let selection):
+                self?.createNote(content: selection.text, richContent: selection.richContent)
             case .failure(let error):
                 self?.presentCaptureError(error)
             }
@@ -124,7 +140,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 },
                 onRequestAccessibility: { [weak self] in
                     self?.requestAccessibilityPermission()
-                }
+                },
+                actionShortcuts: actionShortcuts,
+                defaultShortcuts: Self.defaultShortcuts,
+                onActionShortcutChange: { [weak self] key, shortcut in self?.updateActionShortcut(key, shortcut) ?? false },
+                onActionRecordingChange: { [weak self] key, recording in
+                    guard let self, let id = Self.actionIDs[key], let shortcut = self.actionShortcuts[key] else { return }
+                    if recording { self.hotKeyManager.unregister(id: id) }
+                    else { _ = self.registerActionShortcut(key, shortcut) }
+                },
+                dataDirectory: store.fileURL.deletingLastPathComponent()
             )
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -134,7 +159,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showAllNotes(_ sender: Any?) {
         if controllers.isEmpty {
-            newNote(sender)
+            if notes.isEmpty { newNote(sender) }
+            else { presentLibrary(archived: true) }
             return
         }
 
@@ -154,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func closeCurrentNote(_ sender: Any?) {
-        activeController?.close()
+        activeController?.hide()
         refreshMenuStates()
     }
 
@@ -164,6 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        deleteNote(controller.note.id)
+    }
+
+    private func deleteNote(_ id: UUID) {
+        guard notes[id] != nil else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "删除这张便签？"
@@ -172,19 +203,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let id = controller.note.id
-        controller.window?.orderOut(nil)
+        controllers[id]?.window?.orderOut(nil)
+        reminderService.cancel(id)
         controllers[id] = nil
         notes[id] = nil
         if lastActiveNoteID == id {
             lastActiveNoteID = nil
         }
 
-        if notes.isEmpty {
-            newNote(nil)
-        } else {
-            scheduleSave()
-        }
+        scheduleSave()
+        libraryWindowController?.update(Array(notes.values))
         refreshMenuStates()
     }
 
@@ -232,7 +260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSLog("Easy Sticky recovered notes from backup")
             }
         } catch {
-            notes = [:]
+            storageAvailable = false
+            presentAlert(message: "便签数据无法读取", detail: "为避免覆盖现有数据，已停止保存。请保留数据目录并检查备份。\n\(error.localizedDescription)")
             NSLog("Easy Sticky could not load notes: \(error.localizedDescription)")
         }
     }
@@ -243,15 +272,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let sortedNotes = notes.values.sorted { $0.createdAt < $1.createdAt }
+        let sortedNotes = notes.values.filter { !$0.isArchived }.sorted { $0.createdAt < $1.createdAt }
         for note in sortedNotes {
             controllers[note.id] = makeController(for: note)
         }
 
         let visibleNotes = sortedNotes.filter { !$0.isHidden }
-        if visibleNotes.isEmpty, let mostRecent = sortedNotes.max(by: { $0.updatedAt < $1.updatedAt }) {
-            controllers[mostRecent.id]?.show(focus: true)
-        } else {
+        if !visibleNotes.isEmpty {
             for note in visibleNotes.dropLast() {
                 controllers[note.id]?.show(focus: false)
             }
@@ -274,6 +301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onFocus: { [weak self] id in
                 self?.lastActiveNoteID = id
                 self?.refreshMenuStates()
+            },
+            onAction: { [weak self] id, action in
+                self?.handleAction(id, action)
             }
         )
     }
@@ -297,8 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func nextDefaultFrame() -> CGRect {
         let screen = NSScreen.main?.visibleFrame ?? visibleScreenFrames[0]
         let offset = CGFloat(controllers.count % 7) * 24
-        let width: CGFloat = 320
-        let height: CGFloat = 260
+        let width: CGFloat = 420
+        let height: CGFloat = 340
         return CGRect(
             x: max(screen.minX, screen.maxX - width - 40 - offset),
             y: max(screen.minY, screen.maxY - height - 40 - offset),
@@ -308,6 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func scheduleSave() {
+        controllers.values.forEach { $0.setSaveStatus("保存中…") }
         pendingSave?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.persistImmediately()
@@ -317,22 +348,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func persistImmediately() {
+        guard storageAvailable else { return }
         do {
             try store.save(Array(notes.values))
+            controllers.values.forEach { $0.setSaveStatus("已保存") }
+            libraryWindowController?.update(Array(notes.values))
         } catch {
+            controllers.values.forEach { $0.setSaveStatus("保存失败") }
             NSLog("Easy Sticky could not save notes: \(error.localizedDescription)")
         }
     }
 
     private func registerGlobalHotKeys() {
         let modifiers = UInt32(cmdKey | optionKey)
-        let newNoteRegistered = hotKeyManager.register(
-            id: 1,
-            keyCode: UInt32(kVK_ANSI_N),
-            modifiers: modifiers
-        ) { [weak self] in
-            self?.newNote(nil)
-        }
+        let registered = actionShortcuts.map { registerActionShortcut($0.key, $0.value) }
+        let newNoteRegistered = registered.allSatisfy { $0 }
         let visibilityRegistered = hotKeyManager.register(
             id: 2,
             keyCode: UInt32(kVK_ANSI_S),
@@ -360,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateSelectedTextShortcut(_ shortcut: KeyboardShortcut) -> Bool {
+        guard !actionShortcuts.values.contains(where: { $0.keyCode == shortcut.keyCode && $0.modifiers == shortcut.modifiers }), !(shortcut.keyCode == UInt32(kVK_ANSI_S) && shortcut.modifiers == UInt32(cmdKey | optionKey)) else { return false }
         let previousShortcut = selectedTextShortcut
         guard registerSelectedTextHotKey(shortcut) else {
             if !isRecordingSelectedTextShortcut {
@@ -405,10 +436,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu(title: "Easy Sticky")
         menu.delegate = self
+        menu.addItem(makeItem("偏好设置…", action: #selector(showShortcutPreferences(_:))))
         menu.addItem(makeItem("新建便签", action: #selector(newNote(_:))))
         menu.addItem(makeSelectedTextMenuItem())
         menu.addItem(makeItem("显示全部便签", action: #selector(showAllNotes(_:))))
         menu.addItem(makeItem("隐藏全部便签", action: #selector(hideAllNotes(_:))))
+        menu.addItem(makeItem("便签库…", action: #selector(showLibrary(_:))))
+        menu.addItem(makeItem("已归档的便签…", action: #selector(showArchive(_:))))
         menu.addItem(.separator())
 
         let pinItem = makeItem("置顶显示", action: #selector(toggleCurrentPin(_:)))
@@ -420,6 +454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(spaceItem)
         menu.addItem(makeThemeRootItem())
         menu.addItem(.separator())
+        menu.addItem(makeItem("使用帮助与反馈", action: #selector(showHelp(_:))))
+        menu.addItem(makeItem("关于 Easy Sticky", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), target: NSApp))
         menu.addItem(makeItem("退出 Easy Sticky", action: #selector(NSApplication.terminate(_:)), target: NSApp))
 
         item.menu = menu
@@ -433,7 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appMenu = NSMenu(title: "Easy Sticky")
         appMenu.addItem(makeItem("关于 Easy Sticky", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), target: NSApp))
         appMenu.addItem(.separator())
-        appMenu.addItem(makeItem("快捷键设置…", action: #selector(showShortcutPreferences(_:)), key: ","))
+        appMenu.addItem(makeItem("偏好设置…", action: #selector(showShortcutPreferences(_:)), key: ","))
         appMenu.addItem(.separator())
         appMenu.addItem(makeItem("隐藏 Easy Sticky", action: #selector(NSApplication.hide(_:)), key: "h", target: NSApp))
         appMenu.addItem(makeItem("退出 Easy Sticky", action: #selector(NSApplication.terminate(_:)), key: "q", target: NSApp))
@@ -445,6 +481,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fileMenu.addItem(makeItem("新建便签", action: #selector(newNote(_:)), key: "n"))
         fileMenu.addItem(makeSelectedTextMenuItem())
         fileMenu.addItem(makeItem("关闭便签", action: #selector(closeCurrentNote(_:)), key: "w"))
+        fileMenu.addItem(makeItem("完成并归档", action: #selector(archiveCurrentNote(_:)), key: "d", modifiers: [.command, .shift]))
+        fileMenu.addItem(makeItem("设置提醒…", action: #selector(remindCurrentNote(_:))))
+        fileMenu.addItem(makeItem("便签库…", action: #selector(showLibrary(_:)), key: "l", modifiers: [.command, .shift]))
+        fileMenu.addItem(makeItem("已归档的便签…", action: #selector(showArchive(_:))))
         fileMenu.addItem(.separator())
         let deleteItem = makeItem("删除便签…", action: #selector(deleteCurrentNote(_:)), key: "\u{8}")
         deleteItem.keyEquivalentModifierMask = [.command]
@@ -466,6 +506,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         editRoot.submenu = editMenu
         mainMenu.addItem(editRoot)
 
+        let formatRoot = NSMenuItem()
+        let formatMenu = NSMenu(title: "格式")
+        for (title, command, key) in [("加粗", "bold", "b"), ("斜体", "italic", "i"), ("下划线", "underline", "u"), ("删除线", "strike", ""), ("待办项", "todo", ""), ("插入图片…", "image", ""), ("插入链接…", "link", "k"), ("清除格式", "clear", "")] {
+            let item = makeItem(title, action: #selector(formatCurrentNote(_:)), key: key)
+            item.representedObject = command
+            formatMenu.addItem(item)
+        }
+        formatRoot.submenu = formatMenu
+        mainMenu.addItem(formatRoot)
+
         let viewRoot = NSMenuItem()
         let viewMenu = NSMenu(title: "显示")
         viewMenu.delegate = self
@@ -485,6 +535,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainMenu.addItem(viewRoot)
 
         NSApp.mainMenu = mainMenu
+    }
+
+    private func handleAction(_ id: UUID, _ action: String) {
+        lastActiveNoteID = id
+        switch action {
+        case "new": newNote(nil)
+        case "hide": controllers[id]?.hide()
+        case "archive": archiveNote(id)
+        case "delete": deleteNote(id)
+        case "reminder": showReminder(id)
+        case "library": presentLibrary(archived: false)
+        case "preferences": showShortcutPreferences(nil)
+        default: break
+        }
+    }
+
+    @objc private func formatCurrentNote(_ sender: NSMenuItem) {
+        if let command = sender.representedObject as? String { activeController?.format(command) }
+    }
+
+    private func archiveNote(_ id: UUID) {
+        guard var note = notes[id] else { return }
+        note.archive()
+        reminderService.cancel(id)
+        controllers[id]?.window?.orderOut(nil)
+        controllers[id] = nil
+        notes[id] = note
+        if lastActiveNoteID == id { lastActiveNoteID = nil }
+        scheduleSave()
+        refreshMenuStates()
+    }
+
+    private func openNote(_ id: UUID) {
+        guard var note = notes[id] else { return }
+        if note.isArchived { note.restore(); notes[id] = note }
+        if controllers[id] == nil { controllers[id] = makeController(for: note) }
+        controllers[id]?.show(focus: true)
+        lastActiveNoteID = id
+        scheduleSave()
+    }
+
+    @objc private func archiveCurrentNote(_ sender: Any?) { if let id = activeController?.note.id { archiveNote(id) } }
+    @objc private func remindCurrentNote(_ sender: Any?) { if let id = activeController?.note.id { showReminder(id) } }
+    @objc private func showLibrary(_ sender: Any?) { presentLibrary(archived: false) }
+    @objc private func showArchive(_ sender: Any?) { presentLibrary(archived: true) }
+
+    private func presentLibrary(archived: Bool) {
+        if libraryWindowController == nil {
+            libraryWindowController = NoteLibraryWindowController(onOpen: { [weak self] in self?.openNote($0) }, onDelete: { [weak self] in self?.deleteNote($0) })
+        }
+        libraryWindowController?.update(Array(notes.values), archived: archived)
+        NSApp.activate(ignoringOtherApps: true)
+        libraryWindowController?.showWindow(nil)
+        libraryWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func showReminder(_ id: UUID) {
+        guard let note = notes[id], !note.isArchived else { return }
+        controllers[id]?.showReminderEditor(onSave: { [weak self] date, done in
+            guard let self, let current = self.notes[id], !current.isArchived else { return }
+            self.reminderService.schedule(current, at: date) { [weak self] error in
+                if error == nil {
+                    if let controller = self?.controllers[id] { controller.setReminder(date) }
+                    else { self?.reminderService.cancel(id) }
+                }
+                done(error)
+            }
+        }, onCancel: { [weak self] in
+            self?.reminderService.cancel(id)
+            self?.controllers[id]?.setReminder(nil)
+        })
+    }
+
+    private func registerActionShortcut(_ key: String, _ shortcut: KeyboardShortcut) -> Bool {
+        guard let id = Self.actionIDs[key] else { return false }
+        return hotKeyManager.register(id: id, keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) { [weak self] in
+            switch key {
+            case "new": self?.newNote(nil)
+            case "show": self?.showAllNotes(nil)
+            case "hide": self?.hideAllNotes(nil)
+            default: break
+            }
+        }
+    }
+
+    private func updateActionShortcut(_ key: String, _ shortcut: KeyboardShortcut) -> Bool {
+        let others = actionShortcuts.filter { $0.key != key }.map(\.value) + [selectedTextShortcut, KeyboardShortcut(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | optionKey), keyLabel: "S")]
+        guard !others.contains(where: { $0.keyCode == shortcut.keyCode && $0.modifiers == shortcut.modifiers }) else { return false }
+        guard registerActionShortcut(key, shortcut) else {
+            if let previous = actionShortcuts[key] { _ = registerActionShortcut(key, previous) }
+            return false
+        }
+        actionShortcuts[key] = shortcut
+        if let data = try? JSONEncoder().encode(shortcut) { UserDefaults.standard.set(data, forKey: "shortcut.\(key)") }
+        return true
+    }
+
+    @objc private func showHelp(_ sender: Any?) {
+        NSWorkspace.shared.open(URL(string: "https://code.byted.org/liuyalong.yalo/easy-sticky")!)
     }
 
     private func makeThemeRootItem() -> NSMenuItem {

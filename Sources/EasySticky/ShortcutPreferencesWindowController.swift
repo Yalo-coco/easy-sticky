@@ -4,12 +4,19 @@ import EasyStickyCore
 final class ShortcutPreferencesWindowController: NSWindowController, NSWindowDelegate {
     private let recorder: ShortcutRecorderButton
     private let onRequestAccessibility: () -> Void
+    private let dataDirectory: URL
+    private var actionRecorders: [ShortcutRecorderButton] = []
 
     init(
         shortcut: KeyboardShortcut,
         onShortcutChange: @escaping (KeyboardShortcut) -> Bool,
         onRecordingChange: @escaping (Bool) -> Void,
-        onRequestAccessibility: @escaping () -> Void
+        onRequestAccessibility: @escaping () -> Void,
+        actionShortcuts: [String: KeyboardShortcut],
+        defaultShortcuts: [String: KeyboardShortcut],
+        onActionShortcutChange: @escaping (String, KeyboardShortcut) -> Bool,
+        onActionRecordingChange: @escaping (String, Bool) -> Void,
+        dataDirectory: URL
     ) {
         recorder = ShortcutRecorderButton(
             shortcut: shortcut,
@@ -17,21 +24,43 @@ final class ShortcutPreferencesWindowController: NSWindowController, NSWindowDel
             onRecordingChange: onRecordingChange
         )
         self.onRequestAccessibility = onRequestAccessibility
+        self.dataDirectory = dataDirectory
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 410, height: 210),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         super.init(window: window)
-        window.title = "Easy Sticky 快捷键"
+        window.title = "Easy Sticky 偏好设置"
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.center()
 
         let contentView = NSView()
-        window.contentView = contentView
+        let tabs = NSTabView(frame: window.contentView!.bounds.insetBy(dx: 12, dy: 12))
+        tabs.autoresizingMask = [.width, .height]
+        window.contentView?.addSubview(tabs)
+        let shortcutTab = NSTabViewItem(identifier: "shortcuts")
+        shortcutTab.label = "快捷键"
+        shortcutTab.view = contentView
+        tabs.addTabViewItem(shortcutTab)
+        let dataTab = NSTabViewItem(identifier: "data")
+        dataTab.label = "数据"
+        let dataView = NSStackView()
+        dataView.orientation = .vertical
+        dataView.alignment = .leading
+        dataView.spacing = 20
+        dataView.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        let localInfo = NSTextField(wrappingLabelWithString: "便签仅保存在这台 Mac，无需账号，不上传到服务器。\n\n包含内容、图片、位置、归档和提醒时间。复制整个目录可备份。删除应用不会自动删除便签数据。")
+        let path = NSTextField(wrappingLabelWithString: dataDirectory.path)
+        path.isSelectable = true
+        path.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        let reveal = NSButton(title: "在 Finder 中显示数据目录", target: self, action: #selector(revealData(_:)))
+        [localInfo, path, reveal].forEach(dataView.addArrangedSubview)
+        dataTab.view = dataView
+        tabs.addTabViewItem(dataTab)
 
         let title = NSTextField(labelWithString: "从选中文本新建便签")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -84,6 +113,36 @@ final class ShortcutPreferencesWindowController: NSWindowController, NSWindowDel
             permissionButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             permissionButton.topAnchor.constraint(equalTo: recorder.bottomAnchor, constant: 18)
         ])
+
+        var previous: NSView = permissionButton
+        for (key, name) in [("new", "新建便签"), ("show", "显示全部便签"), ("hide", "隐藏全部便签")] {
+            guard let shortcut = actionShortcuts[key], let fallback = defaultShortcuts[key] else { continue }
+            let label = NSTextField(labelWithString: name)
+            let button = ShortcutRecorderButton(shortcut: shortcut, onChange: { onActionShortcutChange(key, $0) }, onRecordingChange: { onActionRecordingChange(key, $0) }, defaultShortcut: fallback, accessibilityLabel: name + "快捷键")
+            actionRecorders.append(button)
+            let reset = NSButton(title: "恢复默认", target: button, action: #selector(ShortcutRecorderButton.restoreDefault(_:)))
+            for view in [label, button, reset] { view.translatesAutoresizingMaskIntoConstraints = false; contentView.addSubview(view) }
+            NSLayoutConstraint.activate([
+                label.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 18),
+                label.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+                button.centerYAnchor.constraint(equalTo: label.centerYAnchor),
+                button.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 180),
+                button.widthAnchor.constraint(equalToConstant: 146),
+                reset.leadingAnchor.constraint(equalTo: button.trailingAnchor, constant: 10),
+                reset.centerYAnchor.constraint(equalTo: button.centerYAnchor)
+            ])
+            previous = label
+        }
+        let conflictHint = NSTextField(wrappingLabelWithString: "便签内：⌘W 关闭当前便签（保留内容），⌘N 新建。\n全局快捷键冲突时请更换组合；Esc 取消录制。⌥⌘S 切换全部便签显示。")
+        conflictHint.font = .systemFont(ofSize: 11)
+        conflictHint.textColor = .secondaryLabelColor
+        conflictHint.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(conflictHint)
+        NSLayoutConstraint.activate([
+            conflictHint.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 18),
+            conflictHint.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            conflictHint.trailingAnchor.constraint(equalTo: title.trailingAnchor)
+        ])
     }
 
     @available(*, unavailable)
@@ -97,7 +156,10 @@ final class ShortcutPreferencesWindowController: NSWindowController, NSWindowDel
 
     func windowWillClose(_ notification: Notification) {
         recorder.stopRecording()
+        actionRecorders.forEach { $0.stopRecording() }
     }
+
+    @objc private func revealData(_ sender: Any?) { NSWorkspace.shared.open(dataDirectory) }
 }
 
 final class ShortcutRecorderButton: NSButton {
@@ -106,21 +168,25 @@ final class ShortcutRecorderButton: NSButton {
     private let onRecordingChange: (Bool) -> Void
     private var isRecording = false
     private var eventMonitor: Any?
+    private let defaultShortcut: KeyboardShortcut
 
     init(
         shortcut: KeyboardShortcut,
         onChange: @escaping (KeyboardShortcut) -> Bool,
-        onRecordingChange: @escaping (Bool) -> Void
+        onRecordingChange: @escaping (Bool) -> Void,
+        defaultShortcut: KeyboardShortcut = .selectedTextDefault,
+        accessibilityLabel: String = "从选中文本新建便签的快捷键"
     ) {
         self.shortcut = shortcut
         self.onChange = onChange
         self.onRecordingChange = onRecordingChange
+        self.defaultShortcut = defaultShortcut
         super.init(frame: .zero)
         bezelStyle = .rounded
         target = self
         action = #selector(beginRecording(_:))
         updateTitle()
-        setAccessibilityLabel("从选中文本新建便签的快捷键")
+        setAccessibilityLabel(accessibilityLabel)
     }
 
     @available(*, unavailable)
@@ -150,7 +216,7 @@ final class ShortcutRecorderButton: NSButton {
     }
 
     @objc func restoreDefault(_ sender: Any?) {
-        apply(.selectedTextDefault)
+        apply(defaultShortcut)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -197,7 +263,6 @@ final class ShortcutRecorderButton: NSButton {
         } else {
             NSSound.beep()
             title = "快捷键冲突，请重试"
-            isRecording = true
         }
     }
 

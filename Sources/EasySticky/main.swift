@@ -1,6 +1,9 @@
 import AppKit
 
 let application = NSApplication.shared
+if CommandLine.arguments.contains("--check-features") {
+    exit(runFeatureChecks())
+}
 let appDelegate = AppDelegate()
 
 application.delegate = appDelegate

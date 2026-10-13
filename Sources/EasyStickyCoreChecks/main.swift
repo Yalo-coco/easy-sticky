@@ -175,6 +175,41 @@ run("corrupt primary recovers from backup") {
     }
 }
 
+run("old v1 note without new fields remains readable") {
+    let original = StickyNote(content: "已有便签", theme: .mint)
+    var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as! [String: Any]
+    for key in ["richContent", "archivedAt", "reminderDate"] { object.removeValue(forKey: key) }
+    let restored = try JSONDecoder().decode(StickyNote.self, from: JSONSerialization.data(withJSONObject: object))
+    try check(restored == original, "old note changed during migration")
+    try check(!restored.isArchived && restored.reminderDate == nil && restored.richContent == nil, "new optional fields did not default safely")
+}
+
+run("archive cancels reminder but preserves content and appearance") {
+    var note = StickyNote(content: "待办", theme: .rose)
+    note.richContent = Data([1, 2, 3])
+    note.reminderDate = Date().addingTimeInterval(600)
+    note.archive(at: Date(timeIntervalSince1970: 500))
+    try check(note.isArchived && note.isHidden && note.reminderDate == nil, "archive did not clear active state")
+    try check(note.content == "待办" && note.theme == .rose && note.richContent == Data([1, 2, 3]), "archive lost document")
+    note.restore()
+    try check(!note.isArchived && !note.isHidden, "restore did not make note active")
+    try check(note.reminderDate == nil, "restore resurrected old reminder")
+}
+
+run("rich document and reminder survive storage") {
+    try withTemporaryStore { store in
+        var note = StickyNote(content: "图片与文字")
+        note.setDocument(text: "图片与文字", richContent: Data([1, 2, 3, 4]))
+        note.reminderDate = Date(timeIntervalSince1970: 2_000_000_000)
+        var archive = StickyNote(content: "已完成")
+        archive.archive()
+        try store.save([note, archive])
+        let restored = try store.load().notes
+        try check(restored.first(where: { $0.id == note.id }) == note, "rich reminder note changed")
+        try check(restored.first(where: { $0.id == archive.id }) == archive, "archived state lost")
+    }
+}
+
 print("\n\(passedCount) passed, \(failedCount) failed")
 if failedCount > 0 {
     exit(EXIT_FAILURE)

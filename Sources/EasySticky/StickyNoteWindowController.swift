@@ -3,62 +3,74 @@ import EasyStickyCore
 
 final class StickyNoteWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     private(set) var note: StickyNote
-
     private let onChange: (StickyNote) -> Void
     private let onFocus: (UUID) -> Void
-    private let textView = NSTextView()
-    private let rootView = HoverTrackingView()
-    private let controlsBackground = NSVisualEffectView()
-    private let pinButton = NSButton()
-    private let spacesButton = NSButton()
-    private let themeButton = NSButton()
+    private let onAction: (UUID, String) -> Void
+    private let textView = RichNoteEditor()
+    private let rootView = NotePaperView()
+    private let scrollView = NSScrollView()
+    private let headerTitle = NSTextField(labelWithString: "随手记")
+    private let saveLabel = NSTextField(labelWithString: "已保存")
+    private let reminderLabel = NSTextField(labelWithString: "")
+    private let pinButton = NoteIconButton(symbol: "pin", label: "置顶")
+    private let themeButton = NoteIconButton(symbol: "circle.fill", label: "便签颜色")
+    private let reminderButton = NoteIconButton(symbol: "bell", label: "提醒")
+    private let formatButton = NSButton(title: "Aa", target: nil, action: nil)
+    private var editorToolbar: EditorToolbar!
+    private var editorBottom: NSLayoutConstraint!
+    private var reminderEditor: ReminderEditorView?
     private var colorPopover: NSPopover?
     private var isApplyingFrame = false
+    private var isFormattingVisible = false
 
-    init(
-        note: StickyNote,
-        visibleFrames: [CGRect],
-        fallbackFrame: CGRect,
-        onChange: @escaping (StickyNote) -> Void,
-        onFocus: @escaping (UUID) -> Void
-    ) {
+    init(note: StickyNote, visibleFrames: [CGRect], fallbackFrame: CGRect,
+         onChange: @escaping (StickyNote) -> Void, onFocus: @escaping (UUID) -> Void,
+         onAction: @escaping (UUID, String) -> Void) {
         self.note = note
         self.onChange = onChange
         self.onFocus = onFocus
-
-        let initialFrame = (note.frame ?? WindowFrame(fallbackFrame))
-            .normalized(to: visibleFrames, fallback: fallbackFrame)
-            .rect
-        let window = NSWindow(
-            contentRect: initialFrame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
+        self.onAction = onAction
+        let frame = (note.frame ?? WindowFrame(fallbackFrame))
+            .normalized(to: visibleFrames, minimumSize: CGSize(width: 380, height: 300), fallback: fallbackFrame).rect
+        let window = StickyPanel(contentRect: frame,
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        window.hidesOnDeactivate = false
         super.init(window: window)
-
-        configureWindow(window)
-        configureContent()
+        window.onNoteShortcut = { [weak self] command in
+            guard let self else { return }
+            if command == "hide" { self.hide() }
+            else { self.onAction(self.note.id, command) }
+        }
+        window.delegate = self
+        window.title = "Easy Sticky"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 380, height: 300)
+        window.hasShadow = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.setAccessibilityTitle("Easy Sticky 便签")
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(kind)?.isHidden = true
+        }
+        configureContent(window)
         applyAppearance()
-        self.note.frame = WindowFrame(initialFrame)
+        self.note.frame = WindowFrame(frame)
     }
 
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func show(focus: Bool) {
         note.setWindowState(isHidden: false)
         onChange(note)
-
         if focus {
-            NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
             window?.makeFirstResponder(textView)
-        } else {
-            window?.orderFront(nil)
-        }
+        } else { window?.orderFront(nil) }
     }
 
     func hide() {
@@ -75,8 +87,7 @@ final class StickyNoteWindowController: NSWindowController, NSWindowDelegate, NS
     }
 
     func toggleDisplayMode() {
-        let nextMode: NoteDisplayMode = note.displayMode == .allSpaces ? .currentSpace : .allSpaces
-        note.setWindowState(displayMode: nextMode)
+        note.setWindowState(displayMode: note.displayMode == .allSpaces ? .currentSpace : .allSpaces)
         applyWindowBehavior()
         onChange(note)
     }
@@ -87,305 +98,313 @@ final class StickyNoteWindowController: NSWindowController, NSWindowDelegate, NS
         onChange(note)
     }
 
+    func format(_ command: String) { textView.format(command) }
+    func setSaveStatus(_ text: String) { saveLabel.stringValue = text }
+
+    func setReminder(_ date: Date?) {
+        note.reminderDate = date
+        note.updatedAt = Date()
+        updateReminderDisplay()
+        onChange(note)
+    }
+
+    func showReminderEditor(onSave: @escaping (Date, @escaping (Error?) -> Void) -> Void,
+                            onCancel: @escaping () -> Void) {
+        if reminderEditor != nil { dismissReminderEditor(); return }
+        let editor = ReminderEditorView(date: note.reminderDate, onSave: onSave,
+                                        onCancel: onCancel, onClose: { [weak self] in self?.dismissReminderEditor() })
+        editor.translatesAutoresizingMaskIntoConstraints = false
+        rootView.addSubview(editor)
+        reminderEditor = editor
+        NSLayoutConstraint.activate([
+            editor.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 54),
+            editor.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 18),
+            editor.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -18),
+            editor.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -18)
+        ])
+        scrollView.isHidden = true
+        editorToolbar.isHidden = true
+        formatButton.isHidden = true
+        saveLabel.isHidden = true
+        reminderLabel.isHidden = true
+        headerTitle.stringValue = "提醒"
+        reminderButton.isHighlightedState = true
+    }
+
+    private func dismissReminderEditor() {
+        reminderEditor?.removeFromSuperview()
+        reminderEditor = nil
+        scrollView.isHidden = false
+        editorToolbar.isHidden = !isFormattingVisible
+        formatButton.isHidden = false
+        saveLabel.isHidden = false
+        reminderLabel.isHidden = false
+        headerTitle.stringValue = "随手记"
+        updateReminderDisplay()
+        window?.makeFirstResponder(textView)
+    }
+
     func normalizeFrame(to visibleFrames: [CGRect]) {
         guard let window else { return }
-        let normalized = WindowFrame(window.frame).normalized(to: visibleFrames).rect
-        guard normalized != window.frame else { return }
-
+        let frame = WindowFrame(window.frame).normalized(to: visibleFrames, minimumSize: CGSize(width: 380, height: 300)).rect
+        guard frame != window.frame else { return }
         isApplyingFrame = true
-        window.setFrame(normalized, display: true, animate: true)
+        window.setFrame(frame, display: true, animate: true)
         isApplyingFrame = false
-        note.setWindowState(frame: WindowFrame(normalized))
+        note.setWindowState(frame: WindowFrame(frame))
         onChange(note)
     }
 
     func textDidChange(_ notification: Notification) {
-        note.setContent(textView.string)
+        note.setDocument(text: textView.string, richContent: textView.documentData)
         onChange(note)
     }
-
-    func windowDidMove(_ notification: Notification) {
-        saveCurrentFrame()
-    }
-
-    func windowDidResize(_ notification: Notification) {
-        saveCurrentFrame()
-    }
-
-    func windowDidBecomeKey(_ notification: Notification) {
-        onFocus(note.id)
-        updateControlsVisibility(animated: true)
-    }
-
+    func windowDidMove(_ notification: Notification) { saveFrame() }
+    func windowDidResize(_ notification: Notification) { saveFrame() }
+    func windowDidBecomeKey(_ notification: Notification) { onFocus(note.id) }
     func windowDidResignKey(_ notification: Notification) {
-        updateControlsVisibility(animated: true)
+        if !note.isAlwaysOnTop { window?.orderBack(nil) }
     }
-
     func windowWillClose(_ notification: Notification) {
         note.setWindowState(isHidden: true)
         onChange(note)
     }
 
-    @objc private func pinButtonPressed(_ sender: Any?) {
-        toggleAlwaysOnTop()
-    }
-
-    @objc private func spacesButtonPressed(_ sender: Any?) {
-        toggleDisplayMode()
-    }
-
-    @objc private func themeButtonPressed(_ sender: Any?) {
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentViewController = ColorPaletteViewController(
-            selectedTheme: note.theme,
-            onSelect: { [weak self, weak popover] theme in
-                self?.setTheme(theme)
-                popover?.performClose(nil)
-            }
-        )
-        colorPopover = popover
-        popover.show(relativeTo: themeButton.bounds, of: themeButton, preferredEdge: .maxY)
-    }
-
-    private func configureWindow(_ window: NSWindow) {
-        window.delegate = self
-        window.title = "Easy Sticky"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.titlebarSeparatorStyle = .none
-        window.isMovableByWindowBackground = true
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 220, height: 140)
-        window.hasShadow = true
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.setAccessibilityTitle("Easy Sticky 便签")
-    }
-
-    private func configureContent() {
-        guard let window else { return }
-
-        rootView.wantsLayer = true
-        rootView.onHoverChange = { [weak self] _ in
-            self?.updateControlsVisibility(animated: true)
-        }
-        rootView.onAppearanceChange = { [weak self] in
-            self?.applyAppearance()
-        }
+    private func configureContent(_ window: NSWindow) {
         window.contentView = rootView
+        rootView.wantsLayer = true
+        rootView.onAppearanceChange = { [weak self] in self?.applyAppearance() }
 
-        controlsBackground.translatesAutoresizingMaskIntoConstraints = false
-        controlsBackground.material = .popover
-        controlsBackground.blendingMode = .withinWindow
-        controlsBackground.state = .active
-        controlsBackground.wantsLayer = true
-        controlsBackground.layer?.cornerRadius = 12
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.spacing = 3
+        let add = NoteIconButton(symbol: "plus", label: "新建便签")
+        let complete = NoteIconButton(symbol: "checkmark", label: "完成并归档")
+        let more = NoteIconButton(symbol: "ellipsis", label: "更多操作")
+        for (button, action) in [(add, "new"), (pinButton, "pin"), (reminderButton, "reminder"), (complete, "archive"), (more, "more")] {
+            button.identifier = NSUserInterfaceItemIdentifier(action)
+            button.target = self
+            button.action = #selector(headerPressed(_:))
+            header.addArrangedSubview(button)
+        }
+        themeButton.target = self
+        themeButton.action = #selector(themePressed(_:))
+        themeButton.imageScaling = .scaleProportionallyDown
+        headerTitle.font = .systemFont(ofSize: 12, weight: .medium)
+        headerTitle.textColor = .secondaryLabelColor
 
-        configureHeaderButton(
-            pinButton,
-            symbolName: "pin.fill",
-            fallbackTitle: "置顶",
-            toolTip: "切换置顶显示",
-            action: #selector(pinButtonPressed(_:))
-        )
-        configureHeaderButton(
-            spacesButton,
-            symbolName: "square.on.square",
-            fallbackTitle: "桌面",
-            toolTip: "切换所有桌面/当前桌面",
-            action: #selector(spacesButtonPressed(_:))
-        )
-        configureHeaderButton(
-            themeButton,
-            symbolName: "paintpalette.fill",
-            fallbackTitle: "主题",
-            toolTip: "选择这张便签的颜色",
-            action: #selector(themeButtonPressed(_:))
-        )
-
-        let scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        textView.load(text: note.content, data: note.richContent)
+        textView.delegate = self
+        textView.isSelectable = true
+        textView.isAutomaticLinkDetectionEnabled = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 12, height: 8)
+        textView.autoresizingMask = [.width]
+        textView.minSize = .zero
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 340, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.setAccessibilityLabel("便签正文")
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.scrollerStyle = .overlay
         scrollView.autohidesScrollers = true
-
-        textView.string = note.content
-        textView.delegate = self
-        textView.isRichText = false
-        textView.importsGraphics = false
-        textView.allowsUndo = true
-        textView.isEditable = true
-        textView.isSelectable = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.drawsBackground = false
-        textView.font = .systemFont(ofSize: 15.5, weight: .regular)
-        textView.textContainerInset = NSSize(width: 15, height: 13)
-        textView.autoresizingMask = [.width]
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainer?.containerSize = NSSize(
-            width: scrollView.contentSize.width,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainer?.widthTracksTextView = true
-        textView.setAccessibilityLabel("便签正文")
         scrollView.documentView = textView
 
-        rootView.addSubview(controlsBackground)
-        [pinButton, spacesButton, themeButton].forEach(controlsBackground.addSubview)
-        rootView.addSubview(scrollView)
-
+        editorToolbar = EditorToolbar(editor: textView)
+        editorToolbar.isHidden = true
+        formatButton.target = self
+        formatButton.action = #selector(toggleFormat(_:))
+        formatButton.font = .systemFont(ofSize: 14, weight: .medium)
+        formatButton.isBordered = false
+        formatButton.refusesFirstResponder = true
+        formatButton.toolTip = "显示或收起格式工具"
+        formatButton.setAccessibilityLabel("格式工具")
+        saveLabel.font = .systemFont(ofSize: 10)
+        saveLabel.textColor = .tertiaryLabelColor
+        reminderLabel.font = .systemFont(ofSize: 10)
+        reminderLabel.textColor = .secondaryLabelColor
+        reminderLabel.lineBreakMode = .byTruncatingTail
+        for view in [themeButton, headerTitle, header, scrollView, editorToolbar!, formatButton, saveLabel, reminderLabel] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            rootView.addSubview(view)
+        }
+        editorBottom = scrollView.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -40)
         NSLayoutConstraint.activate([
-            controlsBackground.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 6),
-            controlsBackground.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -8),
-            controlsBackground.heightAnchor.constraint(equalToConstant: 25),
-
-            themeButton.topAnchor.constraint(equalTo: controlsBackground.topAnchor),
-            themeButton.trailingAnchor.constraint(equalTo: controlsBackground.trailingAnchor, constant: -3),
-            themeButton.widthAnchor.constraint(equalToConstant: 27),
-            themeButton.heightAnchor.constraint(equalTo: controlsBackground.heightAnchor),
-
-            spacesButton.centerYAnchor.constraint(equalTo: themeButton.centerYAnchor),
-            spacesButton.trailingAnchor.constraint(equalTo: themeButton.leadingAnchor, constant: -2),
-            spacesButton.widthAnchor.constraint(equalToConstant: 27),
-            spacesButton.heightAnchor.constraint(equalTo: controlsBackground.heightAnchor),
-
-            pinButton.centerYAnchor.constraint(equalTo: themeButton.centerYAnchor),
-            pinButton.trailingAnchor.constraint(equalTo: spacesButton.leadingAnchor, constant: -2),
-            pinButton.leadingAnchor.constraint(equalTo: controlsBackground.leadingAnchor, constant: 3),
-            pinButton.widthAnchor.constraint(equalToConstant: 27),
-            pinButton.heightAnchor.constraint(equalTo: controlsBackground.heightAnchor),
-
-            scrollView.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 36),
-            scrollView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 4),
-            scrollView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -4),
-            scrollView.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -4)
+            themeButton.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 12),
+            themeButton.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 10),
+            headerTitle.leadingAnchor.constraint(equalTo: themeButton.trailingAnchor, constant: 2),
+            headerTitle.centerYAnchor.constraint(equalTo: themeButton.centerYAnchor),
+            header.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -12),
+            header.centerYAnchor.constraint(equalTo: themeButton.centerYAnchor),
+            scrollView.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 50),
+            scrollView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 10),
+            scrollView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -10),
+            editorBottom,
+            formatButton.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 18),
+            formatButton.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -10),
+            formatButton.widthAnchor.constraint(equalToConstant: 28),
+            saveLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+            saveLabel.centerYAnchor.constraint(equalTo: formatButton.centerYAnchor),
+            reminderLabel.leadingAnchor.constraint(equalTo: formatButton.trailingAnchor, constant: 12),
+            reminderLabel.trailingAnchor.constraint(lessThanOrEqualTo: saveLabel.leadingAnchor, constant: -12),
+            reminderLabel.centerYAnchor.constraint(equalTo: formatButton.centerYAnchor),
+            editorToolbar.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 14),
+            editorToolbar.trailingAnchor.constraint(lessThanOrEqualTo: rootView.trailingAnchor, constant: -10),
+            editorToolbar.bottomAnchor.constraint(equalTo: formatButton.topAnchor, constant: -8)
         ])
-        updateControlsVisibility(animated: false)
     }
 
-    private func configureHeaderButton(
-        _ button: NSButton,
-        symbolName: String,
-        fallbackTitle: String,
-        toolTip: String,
-        action: Selector
-    ) {
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.isBordered = false
-        button.bezelStyle = .inline
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip)
-        if button.image == nil {
-            button.title = fallbackTitle
+    @objc private func headerPressed(_ sender: NSButton) {
+        switch sender.identifier?.rawValue {
+        case "pin": toggleAlwaysOnTop()
+        case "more":
+            let menu = NSMenu()
+            for (title, command) in [
+                ("关闭便签（保留内容）", "hide"),
+                (note.displayMode == .allSpaces ? "仅在当前桌面显示" : "在所有桌面显示", "spaces"),
+                ("便签库…", "library"), ("偏好设置…", "preferences"),
+                ("删除便签…", "delete")
+            ] {
+                if command == "delete" { menu.addItem(.separator()) }
+                let item = NSMenuItem(title: title, action: #selector(moreChosen(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = command
+                if command == "hide" { item.keyEquivalent = "w"; item.keyEquivalentModifierMask = .command }
+                menu.addItem(item)
+            }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 5), in: sender)
+        default: onAction(note.id, sender.identifier?.rawValue ?? "")
         }
-        button.toolTip = toolTip
-        button.target = self
-        button.action = action
-        button.focusRingType = .none
+    }
+
+    @objc private func moreChosen(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? String else { return }
+        if command == "spaces" { toggleDisplayMode() }
+        else { onAction(note.id, command) }
+    }
+
+    @objc private func toggleFormat(_ sender: Any?) {
+        isFormattingVisible.toggle()
+        editorToolbar.isHidden = !isFormattingVisible
+        editorBottom.constant = isFormattingVisible ? -78 : -40
+        formatButton.contentTintColor = isFormattingVisible ? note.theme.accentColor(for: rootView.effectiveAppearance) : .secondaryLabelColor
+        window?.makeFirstResponder(textView)
+    }
+
+    @objc private func themePressed(_ sender: Any?) {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = ColorPaletteViewController(selectedTheme: note.theme) { [weak self, weak popover] theme in
+            self?.setTheme(theme)
+            popover?.performClose(nil)
+        }
+        colorPopover = popover
+        popover.show(relativeTo: themeButton.bounds, of: themeButton, preferredEdge: .maxY)
     }
 
     private func applyWindowBehavior() {
         guard let window else { return }
         window.level = note.isAlwaysOnTop ? .floating : .normal
+        // Joining desktop Spaces alone does not opt into other apps' full-screen Spaces.
         window.collectionBehavior = note.displayMode == .allSpaces
-            ? [.canJoinAllSpaces, .fullScreenAuxiliary]
+            ? [.canJoinAllSpaces, .canJoinAllApplications, .stationary, .fullScreenAuxiliary]
             : [.managed, .fullScreenAuxiliary]
-
-        let appearance = rootView.effectiveAppearance
-        let activeColor = note.theme.accentColor(for: appearance)
-        let inactiveColor = note.theme.foregroundColor(for: appearance).withAlphaComponent(0.52)
-        pinButton.image = NSImage(
-            systemSymbolName: note.isAlwaysOnTop ? "pin.fill" : "pin",
-            accessibilityDescription: "切换置顶显示"
-        )
-        spacesButton.image = NSImage(
-            systemSymbolName: note.displayMode == .allSpaces ? "square.on.square.fill" : "square.on.square",
-            accessibilityDescription: "切换所有桌面/当前桌面"
-        )
-        pinButton.contentTintColor = note.isAlwaysOnTop ? activeColor : inactiveColor
-        spacesButton.contentTintColor = note.displayMode == .allSpaces ? activeColor : inactiveColor
-        themeButton.contentTintColor = activeColor
+        pinButton.image = NSImage(systemSymbolName: note.isAlwaysOnTop ? "pin.fill" : "pin", accessibilityDescription: "置顶")
+        pinButton.isHighlightedState = note.isAlwaysOnTop
         pinButton.setAccessibilityValue(note.isAlwaysOnTop ? "已置顶" : "未置顶")
-        spacesButton.setAccessibilityValue(note.displayMode == .allSpaces ? "所有桌面" : "当前桌面")
+    }
+
+    private func updateReminderDisplay() {
+        reminderButton.isHighlightedState = note.reminderDate != nil || reminderEditor != nil
+        reminderButton.image = NSImage(systemSymbolName: note.reminderDate == nil ? "bell" : "bell.badge", accessibilityDescription: "提醒")
+        if let date = note.reminderDate {
+            reminderLabel.stringValue = "◷ " + date.formatted(date: .abbreviated, time: .shortened)
+            reminderButton.toolTip = "提醒：" + date.formatted(date: .abbreviated, time: .shortened)
+        } else {
+            reminderLabel.stringValue = ""
+            reminderButton.toolTip = "设置提醒"
+        }
     }
 
     private func applyAppearance() {
         let appearance = rootView.effectiveAppearance
         rootView.layer?.backgroundColor = note.theme.backgroundColor(for: appearance).cgColor
-        rootView.layer?.cornerRadius = 12
+        rootView.layer?.cornerRadius = 16
+        rootView.layer?.borderWidth = 0.5
+        rootView.layer?.borderColor = note.theme.accentColor(for: appearance).withAlphaComponent(0.13).cgColor
         rootView.layer?.masksToBounds = true
-        textView.textColor = note.theme.foregroundColor(for: appearance)
+        themeButton.contentTintColor = note.theme.accentColor(for: appearance)
         textView.insertionPointColor = note.theme.accentColor(for: appearance)
         applyWindowBehavior()
+        updateReminderDisplay()
     }
 
-    private func updateControlsVisibility(animated: Bool) {
-        let alpha: CGFloat = rootView.isMouseInside || window?.isKeyWindow == true ? 1 : 0
-        if alpha > 0 {
-            controlsBackground.isHidden = false
-        }
-        guard animated else {
-            controlsBackground.alphaValue = alpha
-            controlsBackground.isHidden = alpha == 0
-            return
-        }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.14
-            controlsBackground.animator().alphaValue = alpha
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            if !self.rootView.isMouseInside, self.window?.isKeyWindow != true {
-                self.controlsBackground.isHidden = true
-            }
-        })
-    }
-
-    private func saveCurrentFrame() {
+    private func saveFrame() {
         guard !isApplyingFrame, let window else { return }
         note.setWindowState(frame: WindowFrame(window.frame))
         onChange(note)
     }
 }
 
-private final class HoverTrackingView: NSView {
-    var onHoverChange: ((Bool) -> Void)?
-    var onAppearanceChange: (() -> Void)?
-    private(set) var isMouseInside = false
-    private var hoverTrackingArea: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        if let hoverTrackingArea {
-            removeTrackingArea(hoverTrackingArea)
+/// Nonactivating panels cannot rely on the foreground application's menu shortcuts.
+final class StickyPanel: NSPanel {
+    var onNoteShortcut: ((String) -> Void)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if modifiers == .command, let key = event.charactersIgnoringModifiers?.lowercased(),
+           let command = ["w": "hide", "n": "new"][key] {
+            onNoteShortcut?(command)
+            return true
         }
-        let trackingArea = NSTrackingArea(
-            rect: .zero,
-            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
-            owner: self
-        )
-        addTrackingArea(trackingArea)
-        hoverTrackingArea = trackingArea
-        super.updateTrackingAreas()
+        return super.performKeyEquivalent(with: event)
     }
+}
 
-    override func mouseEntered(with event: NSEvent) {
-        isMouseInside = true
-        onHoverChange?(true)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isMouseInside = false
-        onHoverChange?(false)
-    }
-
+private final class NotePaperView: NSView {
+    var onAppearanceChange: (() -> Void)?
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         onAppearanceChange?()
+    }
+}
+
+final class NoteIconButton: NSButton {
+    var isHighlightedState = false { didSet { needsDisplay = true } }
+    private var isHovered = false
+    private var tracking: NSTrackingArea?
+
+    init(symbol: String, label: String) {
+        super.init(frame: .zero)
+        image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        title = ""
+        isBordered = false
+        refusesFirstResponder = true
+        focusRingType = .none
+        toolTip = label
+        contentTintColor = .secondaryLabelColor
+        setAccessibilityLabel(label)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 28).isActive = true
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func updateTrackingAreas() {
+        if let tracking { removeTrackingArea(tracking) }
+        tracking = NSTrackingArea(rect: .zero, options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self)
+        addTrackingArea(tracking!)
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { isHovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false; needsDisplay = true }
+    override func draw(_ dirtyRect: NSRect) {
+        if isHovered || isHighlightedState {
+            NSColor.labelColor.withAlphaComponent(isHovered ? 0.09 : 0.05).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7).fill()
+        }
+        super.draw(dirtyRect)
     }
 }

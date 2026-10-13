@@ -18,24 +18,64 @@ enum SelectedTextCaptureError: LocalizedError, Equatable {
     }
 }
 
+/// Copy and ordinary paste share the same format precedence and RTFD persistence.
+struct CapturedSelection {
+    let document: NSAttributedString
+    var text: String { document.string }
+    var richContent: Data? {
+        document.rtfd(from: NSRange(location: 0, length: document.length), documentAttributes: [:])
+    }
+
+    static func read(from pasteboard: NSPasteboard) -> CapturedSelection? {
+        for (type, format) in [
+            (NSPasteboard.PasteboardType.rtfd, NSAttributedString.DocumentType.rtfd),
+            (.rtf, .rtf), (.html, .html)
+        ] {
+            if let data = pasteboard.data(forType: type),
+               let document = try? NSAttributedString(data: data, options: [.documentType: format], documentAttributes: nil),
+               document.length > 0 {
+                return CapturedSelection(document: document)
+            }
+        }
+        if let raw = pasteboard.string(forType: .fileURL), let url = URL(string: raw), url.isFileURL,
+           let data = try? Data(contentsOf: url),
+           let document = RichNoteEditor.imageDocument(data: data, filename: url.lastPathComponent) {
+            return CapturedSelection(document: document)
+        }
+        for (type, filename) in [(NSPasteboard.PasteboardType.png, "image.png"), (.tiff, "image.tiff")] {
+            if let data = pasteboard.data(forType: type),
+               let document = RichNoteEditor.imageDocument(data: data, filename: filename) {
+                return CapturedSelection(document: document)
+            }
+        }
+        guard let text = pasteboard.string(forType: .string), !text.isBlank else { return nil }
+        return CapturedSelection(document: NSAttributedString(string: text, attributes: RichNoteEditor.defaultAttributes))
+    }
+}
+
 final class SelectedTextCapture {
+    private var isCapturing = false
     func requestAccessibilityPermission() -> Bool {
         let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         return AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
     }
 
-    func capture(completion: @escaping (Result<String, SelectedTextCaptureError>) -> Void) {
+    func capture(completion: @escaping (Result<CapturedSelection, SelectedTextCaptureError>) -> Void) {
+        guard !isCapturing else { return }
         guard AXIsProcessTrusted() else {
             _ = requestAccessibilityPermission()
             completion(.failure(.accessibilityPermissionRequired))
             return
         }
 
-        if let selectedText = selectedTextFromAccessibility(), !selectedText.isBlank {
-            completion(.success(selectedText))
-            return
+        let fallback = selectedTextFromAccessibility()
+        isCapturing = true
+        captureByCopying { [weak self] result in
+            self?.isCapturing = false
+            if case .failure = result, let fallback, !fallback.isBlank {
+                completion(.success(CapturedSelection(document: NSAttributedString(string: fallback, attributes: RichNoteEditor.defaultAttributes))))
+            } else { completion(result) }
         }
-        captureByCopying(completion: completion)
     }
 
     private func selectedTextFromAccessibility() -> String? {
@@ -62,7 +102,7 @@ final class SelectedTextCapture {
     }
 
     private func captureByCopying(
-        completion: @escaping (Result<String, SelectedTextCaptureError>) -> Void
+        completion: @escaping (Result<CapturedSelection, SelectedTextCaptureError>) -> Void
     ) {
         let pasteboard = NSPasteboard.general
         let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
@@ -88,16 +128,20 @@ final class SelectedTextCapture {
         baselineChangeCount: Int,
         attemptsRemaining: Int,
         snapshot: PasteboardSnapshot,
-        completion: @escaping (Result<String, SelectedTextCaptureError>) -> Void
+        completion: @escaping (Result<CapturedSelection, SelectedTextCaptureError>) -> Void
     ) {
         if pasteboard.changeCount != baselineChangeCount {
-            let selectedText = pasteboard.string(forType: .string)
+            // Restore the user's clipboard before HTML import can run the main run loop.
+            let copied = NSPasteboard.withUniqueName()
+            PasteboardSnapshot(pasteboard: pasteboard).restore(to: copied)
             snapshot.restore(to: pasteboard)
-            guard let selectedText, !selectedText.isBlank else {
+            let selection = CapturedSelection.read(from: copied)
+            copied.releaseGlobally()
+            guard let selection else {
                 completion(.failure(.noSelection))
                 return
             }
-            completion(.success(selectedText))
+            completion(.success(selection))
             return
         }
         guard attemptsRemaining > 0 else {

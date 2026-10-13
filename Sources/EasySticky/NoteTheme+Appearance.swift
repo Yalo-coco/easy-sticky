@@ -18,14 +18,14 @@ extension NoteTheme {
     func backgroundColor(for appearance: NSAppearance) -> NSColor {
         let colors: (light: NSColor, dark: NSColor)
         switch self {
-        case .yellow: colors = (rgb(0xFAE9A6), rgb(0x4B432A))
-        case .orange: colors = (rgb(0xF6C895), rgb(0x4C382A))
-        case .rose: colors = (rgb(0xF4BEC8), rgb(0x4A3239))
-        case .lavender: colors = (rgb(0xD9CBF2), rgb(0x3C3549))
-        case .blue: colors = (rgb(0xBDDDF5), rgb(0x2C3D4C))
-        case .mint: colors = (rgb(0xBFE6D4), rgb(0x2C423A))
-        case .sage: colors = (rgb(0xCDDDBF), rgb(0x374232))
-        case .graphite: colors = (rgb(0xD9DBDE), rgb(0x36383B))
+        case .yellow: colors = (rgb(0xFCF5DA), rgb(0x4B432A))
+        case .orange: colors = (rgb(0xFBE8D5), rgb(0x4C382A))
+        case .rose: colors = (rgb(0xFBE4E8), rgb(0x4A3239))
+        case .lavender: colors = (rgb(0xEEE7FA), rgb(0x3C3549))
+        case .blue: colors = (rgb(0xE2EFF9), rgb(0x2C3D4C))
+        case .mint: colors = (rgb(0xE3F3EB), rgb(0x2C423A))
+        case .sage: colors = (rgb(0xEBF0E0), rgb(0x374232))
+        case .graphite: colors = (rgb(0xF0F1F3), rgb(0x36383B))
         }
         return appearance.isDark ? colors.dark : colors.light
     }

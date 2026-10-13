@@ -127,6 +127,12 @@ public struct StickyNote: Codable, Equatable, Identifiable, Sendable {
     public var isAlwaysOnTop: Bool
     public var isHidden: Bool
     public var theme: NoteTheme
+    /// RTFD archive containing rich text and local image attachments.
+    public var richContent: Data?
+    public var archivedAt: Date?
+    public var reminderDate: Date?
+
+    public var isArchived: Bool { archivedAt != nil }
 
     public init(
         id: UUID = UUID(),
@@ -150,9 +156,30 @@ public struct StickyNote: Codable, Equatable, Identifiable, Sendable {
         self.theme = theme
     }
 
+    public mutating func setDocument(text: String, richContent: Data?, at date: Date = Date()) {
+        guard content != text || self.richContent != richContent else { return }
+        content = text
+        self.richContent = richContent
+        updatedAt = date
+    }
+
+    public mutating func archive(at date: Date = Date()) {
+        archivedAt = date
+        isHidden = true
+        reminderDate = nil
+        updatedAt = date
+    }
+
+    public mutating func restore(at date: Date = Date()) {
+        archivedAt = nil
+        isHidden = false
+        updatedAt = date
+    }
+
     public mutating func setContent(_ newContent: String, at date: Date = Date()) {
         guard content != newContent else { return }
         content = newContent
+        richContent = nil
         updatedAt = date
     }
 
