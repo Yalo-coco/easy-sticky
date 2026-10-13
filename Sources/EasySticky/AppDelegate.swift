@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var notes: [UUID: StickyNote] = [:]
     private var controllers: [UUID: StickyNoteWindowController] = [:]
     private var pendingSave: DispatchWorkItem?
+    private let saveQueue = DispatchQueue(label: "EasySticky.persistence", qos: .utility)
+    private var saveRevision = 0
     private var lastActiveNoteID: UUID?
     private var statusItem: NSStatusItem?
     private var dynamicPinItems: [NSMenuItem] = []
@@ -81,9 +83,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenuStates()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         pendingSave?.cancel()
-        persistImmediately()
+        guard storageAvailable else { return .terminateNow }
+        do {
+            let snapshot = try captureNotes()
+            // Drain earlier writes before the final snapshot; no callback waits on the main queue.
+            try saveQueue.sync { try store.save(snapshot) }
+            return .terminateNow
+        } catch {
+            presentAlert(message: "便签尚未保存", detail: "已取消退出，请保留应用并检查磁盘空间。\n\(error.localizedDescription)")
+            return .terminateCancel
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -338,6 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func scheduleSave() {
+        saveRevision += 1
         controllers.values.forEach { $0.setSaveStatus("保存中…") }
         pendingSave?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -350,13 +362,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func persistImmediately() {
         guard storageAvailable else { return }
         do {
-            try store.save(Array(notes.values))
-            controllers.values.forEach { $0.setSaveStatus("已保存") }
-            libraryWindowController?.update(Array(notes.values))
+            let snapshot = try captureNotes()
+            let revision = saveRevision
+            saveQueue.async { [self] in
+                let result = Result { try store.save(snapshot) }
+                DispatchQueue.main.async { [self] in
+                    guard revision == saveRevision else { return }
+                    switch result {
+                    case .success:
+                        controllers.values.forEach { $0.setSaveStatus("已保存") }
+                        libraryWindowController?.update(Array(notes.values))
+                    case .failure(let error): reportSaveFailure(error)
+                    }
+                }
+            }
         } catch {
-            controllers.values.forEach { $0.setSaveStatus("保存失败") }
-            NSLog("Easy Sticky could not save notes: \(error.localizedDescription)")
+            reportSaveFailure(error)
         }
+    }
+
+    private func captureNotes() throws -> [StickyNote] {
+        for (id, controller) in controllers { notes[id] = try controller.flushDocument() }
+        return Array(notes.values)
+    }
+
+    private func reportSaveFailure(_ error: Error) {
+        controllers.values.forEach { $0.setSaveStatus("保存失败") }
+        NSLog("Easy Sticky could not save notes: \(error.localizedDescription)")
     }
 
     private func registerGlobalHotKeys() {
@@ -556,6 +588,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func archiveNote(_ id: UUID) {
+        do {
+            if let controller = controllers[id] { notes[id] = try controller.flushDocument() }
+        } catch { reportSaveFailure(error); return }
         guard var note = notes[id] else { return }
         note.archive()
         reminderService.cancel(id)

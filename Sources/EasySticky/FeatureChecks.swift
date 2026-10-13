@@ -233,6 +233,9 @@ func runFeatureChecks() -> Int32 {
     let future = calendar.date(from: DateComponents(year: 2027, month: 12, day: 31, hour: 23, minute: 58))!
     wheel.setDate(future)
     check(wheel.dateValue == future, "wheel restores future date across year boundary")
+    let storage = runStorageFeatureChecks()
+    total += storage.total
+    failures += storage.failures
     print("\(total - failures) passed, \(failures) failed")
     return failures == 0 ? 0 : 1
 }

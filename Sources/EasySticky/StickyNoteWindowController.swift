@@ -22,6 +22,7 @@ final class StickyNoteWindowController: NSWindowController, NSWindowDelegate, NS
     private var colorPopover: NSPopover?
     private var isApplyingFrame = false
     private var isFormattingVisible = false
+    private var documentDirty = false
 
     init(note: StickyNote, visibleFrames: [CGRect], fallbackFrame: CGRect,
          onChange: @escaping (StickyNote) -> Void, onFocus: @escaping (UUID) -> Void,
@@ -156,8 +157,20 @@ final class StickyNoteWindowController: NSWindowController, NSWindowDelegate, NS
     }
 
     func textDidChange(_ notification: Notification) {
-        note.setDocument(text: textView.string, richContent: textView.documentData)
+        // Keep typing cheap; capture attachments once after the application's save debounce.
+        note.content = textView.string
+        note.updatedAt = Date()
+        documentDirty = true
         onChange(note)
+    }
+
+    func flushDocument() throws -> StickyNote {
+        if documentDirty {
+            guard let data = textView.documentData else { throw NoteStoreError.damagedData }
+            note.richContent = data
+            documentDirty = false
+        }
+        return note
     }
     func windowDidMove(_ notification: Notification) { saveFrame() }
     func windowDidResize(_ notification: Notification) { saveFrame() }
